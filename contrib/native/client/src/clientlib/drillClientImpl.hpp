@@ -21,7 +21,6 @@
 #define DRILL_CLIENT_IMPL_H
 
 #include "drill/common.hpp"
-
 // Define some BOOST defines
 // WIN32_SHUTDOWN_ON_TIMEOUT is defined in "drill/common.hpp" for Windows 32 bit platform
 #ifndef WIN32_SHUTDOWN_ON_TIMEOUT
@@ -29,25 +28,23 @@
 #endif //WIN32_SHUTDOWN_ON_TIMEOUT
 
 #include <algorithm>
-#include <stdlib.h>
-#include <time.h>
 #include <queue>
 #include <vector>
-#include <boost/asio.hpp>
 
+#include <boost/asio.hpp>
 #if defined _WIN32  || defined _WIN64
-#include <zookeeper.h>
 //Windows header files redefine 'random'
 #ifdef random
 #undef random
 #endif
-#else
-#include <zookeeper/zookeeper.h>
 #endif
 #include <boost/asio/deadline_timer.hpp>
+#include <boost/function.hpp>
 #include <boost/thread.hpp>
 
 #include "drill/drillClient.hpp"
+#include "drill/preparedStatement.hpp"
+#include "metadata.hpp"
 #include "rpcEncoder.hpp"
 #include "rpcDecoder.hpp"
 #include "utils.hpp"
@@ -57,6 +54,7 @@
 namespace Drill {
 
 class DrillClientImpl;
+class DrillClientPrepareHandle;
 class InBoundRpcMessage;
 class OutBoundRpcMessage;
 class RecordBatch;
@@ -89,6 +87,8 @@ class DrillClientImplBase{
 
         // Submits a query to a drillbit. 
         virtual DrillClientQueryResult* SubmitQuery(::exec::shared::QueryType t, const std::string& plan, pfnQueryResultsListener listener, void* listenerCtx)=0;
+        virtual DrillClientPrepareHandle* PrepareQuery(const std::string& plan, pfnPreparedStatementListener listener, void* listenerCtx)=0;
+        virtual DrillClientQueryResult* ExecuteQuery(const PreparedStatement& pstmt, pfnQueryResultsListener listener, void* listenerCtx)=0;
 
         //Waits as a connection has results pending
         virtual void waitForResults()=0;
@@ -98,33 +98,74 @@ class DrillClientImplBase{
 
         virtual void freeQueryResources(DrillClientQueryResult* pQryResult)=0;
 
-        virtual Metadata* getMetadata() = 0;
+        virtual meta::DrillMetadata* getMetadata() = 0;
 
-        virtual void freeMetadata(Metadata** metadata) = 0;
+        virtual void freeMetadata(meta::DrillMetadata* metadata) = 0;
 };
 
-class DrillClientQueryResult{
+class DrillClientQueryHandle{
     friend class DrillClientImpl;
     public:
-    DrillClientQueryResult(DrillClientImpl * pClient, int32_t coordId, const std::string& query):
-        m_pClient(pClient),
+    DrillClientQueryHandle(DrillClientImpl& client, int32_t coordId, const std::string& query):
+        m_client(client),
         m_coordinationId(coordId),
         m_query(query),
 		m_status(QRY_SUCCESS),
+        m_bCancel(false),
+        m_bHasError(false),
+        m_pError(NULL) {
+    };
+
+    virtual ~DrillClientQueryHandle(){
+        this->clearAndDestroy();
+    };
+
+    virtual void cancel();
+    bool isCancelled() const {return this->m_bCancel;};
+    int32_t getCoordinationId() const { return this->m_coordinationId;}
+    const std::string&  getQuery() const { return this->m_query;}
+
+    bool hasError() const { return m_bHasError;}
+    status_t getErrorStatus() const { return m_pError!=NULL?(status_t)m_pError->status:QRY_SUCCESS;}
+    const DrillClientError* getError() const { return m_pError;}
+    void setQueryStatus(status_t s){ m_status = s;}
+    status_t getQueryStatus() const { return m_status;}
+    inline DrillClientImpl& client() { return m_client; };
+
+    protected:
+    virtual void signalError(DrillClientError* pErr);
+    virtual void clearAndDestroy();
+    void setHasError(bool hasError) { m_bHasError = hasError; }
+
+    private:
+    DrillClientImpl& m_client;
+
+    int32_t m_coordinationId;
+    std::string m_query;
+    bool m_bCancel;
+    bool m_bHasError;
+
+    const DrillClientError* m_pError;
+
+    status_t m_status;
+};
+
+class DrillClientQueryResult: public DrillClientQueryHandle{
+    friend class DrillClientImpl;
+    public:
+    DrillClientQueryResult(DrillClientImpl& client, int32_t coordId, const std::string& query, pfnQueryResultsListener listener, void* listenerCtx):
+    	DrillClientQueryHandle(client, coordId, query),
         m_numBatches(0),
         m_columnDefs(new std::vector<Drill::FieldMetadata*>),
         m_bIsQueryPending(true),
         m_bIsLastChunk(false),
-        m_bCancel(false),
         m_bHasSchemaChanged(false),
         m_bHasData(false),
-        m_bHasError(false),
         m_queryState(exec::shared::QueryResult_QueryState_STARTING),
-        m_pError(NULL),
         m_pQueryId(NULL),
         m_pSchemaListener(NULL),
-        m_pResultsListener(NULL),
-        m_pListenerCtx(NULL) {
+        m_pResultsListener(listener),
+        m_pListenerCtx(listenerCtx) {
     };
 
     ~DrillClientQueryResult(){
@@ -132,11 +173,6 @@ class DrillClientQueryResult{
     };
 
     // get data asynchronously
-    void registerListener(pfnQueryResultsListener listener, void* listenerCtx){
-        this->m_pResultsListener=listener;
-        this->m_pListenerCtx = listenerCtx;
-    }
-
     void registerSchemaChangeListener(pfnSchemaListener l){
         m_pSchemaListener=l;
     }
@@ -159,20 +195,11 @@ class DrillClientQueryResult{
         return this->m_columnDefs;
     }
 
-    void cancel();
-    bool isCancelled(){return this->m_bCancel;};
     bool hasSchemaChanged(){return this->m_bHasSchemaChanged;};
-    int32_t getCoordinationId(){ return this->m_coordinationId;}
-    const std::string&  getQuery(){ return this->m_query;}
 
     void setQueryId(exec::shared::QueryId* q){this->m_pQueryId=q;}
     void* getListenerContext() {return this->m_pListenerCtx;}
     exec::shared::QueryId& getQueryId(){ return *(this->m_pQueryId); }
-    bool hasError(){ return m_bHasError;}
-    status_t getErrorStatus(){ return m_pError!=NULL?(status_t)m_pError->status:QRY_SUCCESS;}
-    const DrillClientError* getError(){ return m_pError;}
-    void setQueryStatus(status_t s){ m_status = s;}
-    status_t getQueryStatus(){ return m_status;}
 
     void setQueryState(exec::shared::QueryResult_QueryState s){ m_queryState = s;}
     exec::shared::QueryResult_QueryState getQueryState(){ return m_queryState;}
@@ -180,6 +207,9 @@ class DrillClientQueryResult{
         boost::lock_guard<boost::mutex> cvLock(this->m_cvMutex);
         m_bIsQueryPending=isPending;
     }
+    protected:
+    virtual void signalError(DrillClientError* pErr);
+    virtual void clearAndDestroy();
 
     private:
     status_t setupColumnDefs(exec::shared::QueryData* pQueryData);
@@ -187,15 +217,8 @@ class DrillClientQueryResult{
     // Construct a DrillClientError object, set the appropriate state and signal any listeners, condition variables.
     // Also used when a query is cancelled or when a query completed response is received.
     // Error object is now owned by the DrillClientQueryResult object.
-    void signalError(DrillClientError* pErr);
     void signalComplete();
-    void clearAndDestroy();
-
-
-    DrillClientImpl* m_pClient;
-
-    int32_t m_coordinationId;
-    std::string m_query;
+    void notifyListener(RecordBatch* batch, DrillClientError* pErr);
 
     size_t m_numBatches; // number of record batches received so far
 
@@ -217,18 +240,13 @@ class DrillClientQueryResult{
     // if m_bIsQueryPending is true, we continue to wait for results
     bool m_bIsQueryPending;
     bool m_bIsLastChunk;
-    bool m_bCancel;
     bool m_bHasSchemaChanged;
     bool m_bHasData;
-    bool m_bHasError;
 
     // state in the last query result received from the server.
     exec::shared::QueryResult_QueryState m_queryState;
 
-    const DrillClientError* m_pError;
-
     exec::shared::QueryId* m_pQueryId;
-    status_t m_status;
 
     // Schema change listener
     pfnSchemaListener m_pSchemaListener;
@@ -238,6 +256,147 @@ class DrillClientQueryResult{
     // Listener context
     void * m_pListenerCtx;
 };
+
+class DrillClientPrepareHandle: public DrillClientQueryHandle, public PreparedStatement {
+    friend class DrillClientImpl;
+    public:
+    DrillClientPrepareHandle(DrillClientImpl& client, int32_t coordId, const std::string& query, pfnPreparedStatementListener listener, void* listenerCtx):
+    	DrillClientQueryHandle(client, coordId, query),
+		PreparedStatement(),
+        m_columnDefs(new std::vector<Drill::FieldMetadata*>),
+		m_pPreparedStatementListener(listener),
+        m_pListenerCtx(listenerCtx) {
+    };
+
+    ~DrillClientPrepareHandle(){
+        this->clearAndDestroy();
+    };
+
+    // PreparedStatement overrides
+	virtual std::size_t getNumFields() const { return m_columnDefs->size(); }
+	virtual const Drill::FieldMetadata& getFieldMetadata(std::size_t index) const { return *m_columnDefs->at(index);}
+
+    void notifyListener(PreparedStatement* pstmt, DrillClientError* pErr);
+
+    void* getListenerContext() {return this->m_pListenerCtx;}
+
+    protected:
+    virtual void signalError(DrillClientError* pErr);
+    virtual void clearAndDestroy();
+
+    private:
+    status_t setupPreparedStatement(const exec::user::PreparedStatement& pstmt);
+
+    FieldDefPtr m_columnDefs;
+    ::exec::user::PreparedStatementHandle m_preparedStatementHandle;
+
+    // Results callback
+    pfnPreparedStatementListener m_pPreparedStatementListener;
+
+    // Listener context
+    void * m_pListenerCtx;
+};
+
+class DrillClientCatalogResult: public DrillClientQueryHandle {
+    friend class DrillClientImpl;
+    public:
+    DrillClientCatalogResult(DrillClientImpl& client, int32_t coordId, Metadata::pfnCatalogMetadataListener listener, void* listenerCtx):
+    	DrillClientQueryHandle(client, coordId, "getCatalog"),
+		m_pCatalogMetadataListener(listener),
+        m_pListenerCtx(listenerCtx) {
+    };
+
+    ~DrillClientCatalogResult(){
+        this->clearAndDestroy();
+    };
+
+    void notifyListener(const DrillCollection<meta::CatalogMetadata>& metadata, DrillClientError* pErr);
+
+    void* getListenerContext() {return this->m_pListenerCtx;}
+
+    private:
+    // Results callback
+    Metadata::pfnCatalogMetadataListener m_pCatalogMetadataListener;
+
+    // Listener context
+    void * m_pListenerCtx;
+};
+
+class DrillClientSchemaResult: public DrillClientQueryHandle {
+    friend class DrillClientImpl;
+    public:
+    DrillClientSchemaResult(DrillClientImpl& client, int32_t coordId, Metadata::pfnSchemaMetadataListener listener, void* listenerCtx):
+    	DrillClientQueryHandle(client, coordId, "getSchemas"),
+		m_pSchemaMetadataListener(listener),
+        m_pListenerCtx(listenerCtx) {
+    };
+
+    ~DrillClientSchemaResult(){
+        this->clearAndDestroy();
+    };
+
+    void notifyListener(const DrillCollection<meta::SchemaMetadata>& metadata, DrillClientError* pErr);
+
+    void* getListenerContext() {return this->m_pListenerCtx;}
+
+    private:
+    // Results callback
+    Metadata::pfnSchemaMetadataListener m_pSchemaMetadataListener;
+
+    // Listener context
+    void * m_pListenerCtx;
+};
+
+class DrillClientTableResult: public DrillClientQueryHandle {
+    friend class DrillClientImpl;
+    public:
+    DrillClientTableResult(DrillClientImpl& client, int32_t coordId, Metadata::pfnTableMetadataListener listener, void* listenerCtx):
+    	DrillClientQueryHandle(client, coordId, "getTables"),
+		m_pTableMetadataListener(listener),
+        m_pListenerCtx(listenerCtx) {
+    };
+
+    ~DrillClientTableResult(){
+        this->clearAndDestroy();
+    };
+
+    void notifyListener(const DrillCollection<meta::TableMetadata>& metadata, DrillClientError* pErr);
+
+    void* getListenerContext() {return this->m_pListenerCtx;}
+
+    private:
+    // Results callback
+    Metadata::pfnTableMetadataListener m_pTableMetadataListener;
+
+    // Listener context
+    void * m_pListenerCtx;
+};
+
+class DrillClientColumnResult: public DrillClientQueryHandle {
+    friend class DrillClientImpl;
+    public:
+    DrillClientColumnResult(DrillClientImpl& client, int32_t coordId, Metadata::pfnColumnMetadataListener listener, void* listenerCtx):
+    	DrillClientQueryHandle(client, coordId, "getColumns"),
+		m_pColumnMetadataListener(listener),
+        m_pListenerCtx(listenerCtx) {
+    };
+
+    ~DrillClientColumnResult(){
+        this->clearAndDestroy();
+    };
+
+    void notifyListener(const DrillCollection<meta::ColumnMetadata>& metadata, DrillClientError* pErr);
+
+    void* getListenerContext() {return this->m_pListenerCtx;}
+
+    private:
+    // Results callback
+    Metadata::pfnColumnMetadataListener m_pColumnMetadataListener;
+
+    // Listener context
+    void * m_pListenerCtx;
+};
+
 
 class DrillClientImpl : public DrillClientImplBase{
     public:
@@ -305,18 +464,22 @@ class DrillClientImpl : public DrillClientImplBase{
         void Close() ;
         DrillClientError* getError(){ return m_pError;}
         DrillClientQueryResult* SubmitQuery(::exec::shared::QueryType t, const std::string& plan, pfnQueryResultsListener listener, void* listenerCtx);
+        DrillClientPrepareHandle* PrepareQuery(const std::string& plan, pfnPreparedStatementListener listener, void* listenerCtx);
+        DrillClientQueryResult* ExecuteQuery(const PreparedStatement& pstmt, pfnQueryResultsListener listener, void* listenerCtx);
+
         void waitForResults();
         connectionStatus_t validateHandshake(DrillUserProperties* props);
         void freeQueryResources(DrillClientQueryResult* pQryResult){
-            // Doesn't need to do anything
-            return;
+            delete pQryResult;
         };
         
-        Metadata* getMetadata();
+        meta::DrillMetadata* getMetadata();
 
-        void freeMetadata(Metadata** metadata);
+        void freeMetadata(meta::DrillMetadata* metadata);
 
     private:
+        friend class meta::DrillMetadata;
+        friend class DrillClientQueryHandle;
         friend class DrillClientQueryResult;
         friend class PooledDrillClientImpl;
 
@@ -349,13 +512,17 @@ class DrillClientImpl : public DrillClientImplBase{
         status_t readMsg(
                 ByteBuf_t _buf,
                 AllocatedBufferPtr* allocatedBuffer,
-                InBoundRpcMessage& msg,
-                boost::system::error_code& error);
+                InBoundRpcMessage& msg);
         status_t processQueryResult(AllocatedBufferPtr allocatedBuffer, InBoundRpcMessage& msg);
         status_t processQueryData(AllocatedBufferPtr allocatedBuffer, InBoundRpcMessage& msg);
         status_t processCancelledQueryResult( exec::shared::QueryId& qid, exec::shared::QueryResult* qr);
         status_t processQueryId(AllocatedBufferPtr allocatedBuffer, InBoundRpcMessage& msg );
-        DrillClientQueryResult* findQueryResult(exec::shared::QueryId& qid);
+        status_t processPreparedStatement(AllocatedBufferPtr allocatedBuffer, InBoundRpcMessage& msg );
+        status_t processCatalogsResult(AllocatedBufferPtr allocatedBuffer, InBoundRpcMessage& msg );
+        status_t processSchemasResult(AllocatedBufferPtr allocatedBuffer, InBoundRpcMessage& msg );
+        status_t processTablesResult(AllocatedBufferPtr allocatedBuffer, InBoundRpcMessage& msg );
+        status_t processColumnsResult(AllocatedBufferPtr allocatedBuffer, InBoundRpcMessage& msg );
+        DrillClientQueryResult* findQueryResult(const exec::shared::QueryId& qid);
         status_t processQueryStatusResult( exec::shared::QueryResult* qr,
                 DrillClientQueryResult* pDrillClientQueryResult);
         void handleReadTimeout(const boost::system::error_code & err);
@@ -367,15 +534,25 @@ class DrillClientImpl : public DrillClientImplBase{
         status_t handleQryError(status_t status,
                 const exec::shared::DrillPBError& e,
                 DrillClientQueryResult* pQueryResult);
-        // handle query state indicating query is COMPELTED or CANCELED
-        // (i.e., COMPELTED or CANCELED)
+        // handle query state indicating query is COMPLETED or CANCELED
+        // (i.e., COMPLETED or CANCELED)
         status_t handleTerminatedQryState(status_t status,
                 std::string msg,
                 DrillClientQueryResult* pQueryResult);
         void broadcastError(DrillClientError* pErr);
-        void clearMapEntries(DrillClientQueryResult* pQueryResult);
+        void removeQueryHandle(DrillClientQueryHandle* pQueryHandle);
+        void removeQueryResult(DrillClientQueryResult* pQueryResult);
         void sendAck(InBoundRpcMessage& msg, bool isOk);
-        void sendCancel(exec::shared::QueryId* pQueryId);
+        void sendCancel(const exec::shared::QueryId* pQueryId);
+
+        template<typename Handle>
+        Handle* sendMsg(boost::function<Handle*(int32_t)> handleFactory, ::exec::user::RpcType type, const ::google::protobuf::Message& msg);
+
+        // metadata requests
+        DrillClientCatalogResult* getCatalogs(const std::string& catalogPattern, Metadata::pfnCatalogMetadataListener listener, void* listenerCtx);
+        DrillClientSchemaResult* getSchemas(const std::string& catalogPattern, const std::string& schemaPattern, Metadata::pfnSchemaMetadataListener listener, void* listenerCtx);
+        DrillClientTableResult* getTables(const std::string& catalogPattern, const std::string& schemaPattern, const std::string& tablePattern, Metadata::pfnTableMetadataListener listener, void* listenerCtx);
+        DrillClientColumnResult* getColumns(const std::string& catalogPattern, const std::string& schemaPattern, const std::string& tablePattern, const std::string& columnPattern, Metadata::pfnColumnMetadataListener listener, void* listenerCtx);
 
         void shutdownSocket();
 
@@ -423,8 +600,8 @@ class DrillClientImpl : public DrillClientImplBase{
         // Mutex to protect drill client operations
         boost::mutex m_dcMutex;
 
-        // Map of coordination id to  Query Ids.
-        std::map<int, DrillClientQueryResult*> m_queryIds;
+        // Map of coordination id to Query handles.
+        std::map<int, DrillClientQueryHandle*> m_queryHandles;
 
         // Map of query id to query result for currently executing queries
         std::map<exec::shared::QueryId*, DrillClientQueryResult*, compareQueryId> m_queryResults;
@@ -436,7 +613,7 @@ class DrillClientImpl : public DrillClientImplBase{
 };
 
 inline bool DrillClientImpl::Active() {
-    return this->m_bIsConnected;;
+    return this->m_bIsConnected;
 }
 
 
@@ -447,17 +624,11 @@ inline bool DrillClientImpl::Active() {
  * */
 class PooledDrillClientImpl : public DrillClientImplBase{
     public:
-        PooledDrillClientImpl(){
-            m_bIsDirectConnection=false;
-            m_maxConcurrentConnections = DEFAULT_MAX_CONCURRENT_CONNECTIONS;
+        PooledDrillClientImpl(): m_bIsDirectConnection(false), m_maxConcurrentConnections(DEFAULT_MAX_CONCURRENT_CONNECTIONS), m_lastConnection(-1), m_pError(NULL), m_queriesExecuted(0), m_pUserProperties() {
             char* maxConn=std::getenv(MAX_CONCURRENT_CONNECTIONS_ENV);
             if(maxConn!=NULL){
                 m_maxConcurrentConnections=atoi(maxConn);
             }
-            m_lastConnection=-1;
-            m_pError=NULL;
-            m_queriesExecuted=0;
-            m_pUserProperties=NULL;
         }
 
         ~PooledDrillClientImpl(){
@@ -465,7 +636,6 @@ class PooledDrillClientImpl : public DrillClientImplBase{
                 delete *it;
             }
             m_clientConnections.clear();
-            if(m_pUserProperties!=NULL){ delete m_pUserProperties; m_pUserProperties=NULL;}
             if(m_pError!=NULL){ delete m_pError; m_pError=NULL;}
         }
 
@@ -487,6 +657,9 @@ class PooledDrillClientImpl : public DrillClientImplBase{
         // Connections once added to the pool will be removed only when the DrillClient is closed.
         DrillClientQueryResult* SubmitQuery(::exec::shared::QueryType t, const std::string& plan, pfnQueryResultsListener listener, void* listenerCtx);
 
+        DrillClientPrepareHandle* PrepareQuery(const std::string& plan, pfnPreparedStatementListener listener, void* listenerCtx);
+        DrillClientQueryResult* ExecuteQuery(const PreparedStatement& pstmt, pfnQueryResultsListener listener, void* listenerCtx);
+
         //Waits as long as any one drillbit connection has results pending
         void waitForResults();
 
@@ -497,9 +670,9 @@ class PooledDrillClientImpl : public DrillClientImplBase{
 
         int getDrillbitCount(){ return m_drillbits.size();};
         
-        Metadata* getMetadata();
+        meta::DrillMetadata* getMetadata();
 
-        void freeMetadata(Metadata** metadata);
+        void freeMetadata(meta::DrillMetadata* metadata);
 
     private:
         
@@ -511,9 +684,7 @@ class PooledDrillClientImpl : public DrillClientImplBase{
         // is currently executing. If none,  
         std::vector<DrillClientImpl*> m_clientConnections; 
 		boost::mutex m_poolMutex; // protect access to the vector
-        
-        //ZookeeperImpl zook;
-        
+
         // Use this to decide which drillbit to select next from the list of drillbits.
         size_t m_lastConnection;
 		boost::mutex m_cMutex;
@@ -533,44 +704,7 @@ class PooledDrillClientImpl : public DrillClientImplBase{
 
         std::vector<std::string> m_drillbits;
 
-        DrillUserProperties* m_pUserProperties;//Keep a copy of user properties
-};
-
-class ZookeeperImpl{
-    public:
-        ZookeeperImpl();
-        ~ZookeeperImpl();
-        static ZooLogLevel getZkLogLevel();
-        // comma separated host:port pairs, each corresponding to a zk
-        // server. e.g. "127.0.0.1:3000,127.0.0.1:3001,127.0.0.1:3002
-        DEPRECATED int connectToZookeeper(const char* connectStr, const char* pathToDrill);
-        void close();
-        static void watcher(zhandle_t *zzh, int type, int state, const char *path, void* context);
-        void debugPrint();
-        std::string& getError(){return m_err;}
-        const exec::DrillbitEndpoint& getEndPoint(){ return m_drillServiceInstance.endpoint();}
-        // return unshuffled list of drillbits
-        int getAllDrillbits(const char* connectStr, const char* pathToDrill, std::vector<std::string>& drillbits);
-        // picks the index drillbit and returns the corresponding endpoint object
-        int getEndPoint(std::vector<std::string>& drillbits, size_t index, exec::DrillbitEndpoint& endpoint);
-        
-
-    private:
-        static char s_drillRoot[];
-        static char s_defaultCluster[];
-        zhandle_t* m_zh;
-        clientid_t m_id;
-        int m_state;
-        std::string m_err;
-
-        struct String_vector* m_pDrillbits;
-
-        boost::mutex m_cvMutex;
-        // Condition variable to signal connection callback has been processed
-        boost::condition_variable m_cv;
-        bool m_bConnecting;
-        exec::DrillServiceInstance m_drillServiceInstance;
-        std::string m_rootDir;
+        boost::shared_ptr<DrillUserProperties> m_pUserProperties;//Keep a copy of user properties
 };
 
 } // namespace Drill
