@@ -55,7 +55,7 @@ int RpcDecoder::LengthDecode(const uint8_t* buf, uint32_t* p_length) {
 // TODO: error handling
 //
 // - assume that the entire message is in the buffer and the buffer is constrained to this message
-// - easy to handle with raw arry in C++
+// - easy to handle with raw array in C++
 int RpcDecoder::Decode(const uint8_t* buf, int length, InBoundRpcMessage& msg) {
     using google::protobuf::io::CodedInputStream;
 

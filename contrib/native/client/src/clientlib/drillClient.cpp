@@ -25,7 +25,6 @@
 #include "drillClientImpl.hpp"
 #include "errmsgs.hpp"
 #include "logger.hpp"
-
 #include "Types.pb.h"
 
 namespace Drill{
@@ -174,83 +173,86 @@ FieldDefPtr RecordIterator::getColDefs(){
     if(m_pQueryResult->hasError()){
         return DrillClientQueryResult::s_emptyColDefs;
     }
-    //NOTE: if query is cancelled, return whatever you have. Client applications job to deal with it.
-    if(this->m_pColDefs==NULL || this->hasSchemaChanged()){
-        if(this->m_pCurrentRecordBatch==NULL){
-            this->m_pQueryResult->waitForData();
-            if(m_pQueryResult->hasError()){
-                return DrillClientQueryResult::s_emptyColDefs;
-            }
-        }
-        if(this->hasSchemaChanged()){
-            if(m_pColDefs!=NULL){
-                for(std::vector<Drill::FieldMetadata*>::iterator it=m_pColDefs->begin();
-                        it!=m_pColDefs->end();
-                        ++it){
-                    delete *it;
-                }
-                m_pColDefs->clear();
-                //delete m_pColDefs; m_pColDefs=NULL;
-            }
-        }
-        FieldDefPtr pColDefs(  new std::vector<Drill::FieldMetadata*>);
-        {   //lock after we come out of the  wait.
-            boost::lock_guard<boost::mutex> bufferLock(this->m_recordBatchMutex);
-            boost::shared_ptr< std::vector<Drill::FieldMetadata*> >  currentColDefs=DrillClientQueryResult::s_emptyColDefs;
-            if(this->m_pCurrentRecordBatch!=NULL){
-                currentColDefs=this->m_pCurrentRecordBatch->getColumnDefs();
-            }else{
-                // This is reached only when the first results have been received but
-                // the getNext call has not been made to retrieve the record batch
-                RecordBatch* pR=this->m_pQueryResult->peekNext();
-                if(pR!=NULL){
-                    currentColDefs=pR->getColumnDefs();
-                }
-            }
-            for(std::vector<Drill::FieldMetadata*>::iterator it=currentColDefs->begin(); it!=currentColDefs->end(); ++it){
-                Drill::FieldMetadata* fmd= new Drill::FieldMetadata;
-                fmd->copy(*(*it));//Yup, that's 2 stars
-                pColDefs->push_back(fmd);
-            }
-        }
-        this->m_pColDefs = pColDefs;
+
+    if (this->m_pColDefs != NULL && !this->hasSchemaChanged()) {
+    	return this->m_pColDefs;
     }
+
+    //NOTE: if query is cancelled, return whatever you have. Client applications job to deal with it.
+    if(this->m_pCurrentRecordBatch==NULL){
+    	this->m_pQueryResult->waitForData();
+    	if(m_pQueryResult->hasError()){
+    		return DrillClientQueryResult::s_emptyColDefs;
+    	}
+    }
+    if(this->hasSchemaChanged()){
+    	if(m_pColDefs!=NULL){
+    		for(std::vector<Drill::FieldMetadata*>::iterator it=m_pColDefs->begin();
+    				it!=m_pColDefs->end();
+    				++it){
+    			delete *it;
+    		}
+    		m_pColDefs->clear();
+    		//delete m_pColDefs; m_pColDefs=NULL;
+    	}
+    }
+    FieldDefPtr pColDefs(  new std::vector<Drill::FieldMetadata*>);
+    {   //lock after we come out of the  wait.
+    	boost::lock_guard<boost::mutex> bufferLock(this->m_recordBatchMutex);
+    	boost::shared_ptr< std::vector<Drill::FieldMetadata*> >  currentColDefs=DrillClientQueryResult::s_emptyColDefs;
+    	if(this->m_pCurrentRecordBatch!=NULL){
+    		currentColDefs=this->m_pCurrentRecordBatch->getColumnDefs();
+    	}else{
+    		// This is reached only when the first results have been received but
+    		// the getNext call has not been made to retrieve the record batch
+    		RecordBatch* pR=this->m_pQueryResult->peekNext();
+    		if(pR!=NULL){
+    			currentColDefs=pR->getColumnDefs();
+    		}
+    	}
+    	for(std::vector<Drill::FieldMetadata*>::const_iterator it=currentColDefs->begin(); it!=currentColDefs->end(); ++it){
+    		Drill::FieldMetadata* fmd= new Drill::FieldMetadata;
+    		fmd->copy(*(*it));//Yup, that's 2 stars
+    		pColDefs->push_back(fmd);
+    	}
+    }
+    this->m_pColDefs = pColDefs;
     return this->m_pColDefs;
 }
 
 status_t RecordIterator::next(){
     status_t ret=QRY_SUCCESS;
     this->m_currentRecord++;
-
-    if(!this->m_pQueryResult->isCancelled()){
-        if(this->m_pCurrentRecordBatch==NULL || this->m_currentRecord==this->m_pCurrentRecordBatch->getNumRecords()){
-            boost::lock_guard<boost::mutex> bufferLock(this->m_recordBatchMutex);
-            if(this->m_pCurrentRecordBatch !=NULL){
-                DRILL_MT_LOG(DRILL_LOG(LOG_TRACE) << "Deleted old Record batch " << (void*) m_pCurrentRecordBatch << std::endl;)
-                delete this->m_pCurrentRecordBatch; //free the previous record batch
-                this->m_pCurrentRecordBatch=NULL;
-            }
-            this->m_currentRecord=0;
-            this->m_pQueryResult->waitForData();
-            if(m_pQueryResult->hasError()){
-                return m_pQueryResult->getErrorStatus();
-            }
-            this->m_pCurrentRecordBatch=this->m_pQueryResult->getNext();
-            if(this->m_pCurrentRecordBatch != NULL){
-                DRILL_MT_LOG(DRILL_LOG(LOG_TRACE) << "Fetched new Record batch " << std::endl;)
-            }else{
-                DRILL_MT_LOG(DRILL_LOG(LOG_TRACE) << "No new Record batch found " << std::endl;)
-            }
-            if(this->m_pCurrentRecordBatch==NULL || this->m_pCurrentRecordBatch->getNumRecords()==0){
-                DRILL_MT_LOG(DRILL_LOG(LOG_TRACE) << "No more data." << std::endl;)
-                ret = QRY_NO_MORE_DATA;
-            }else if(this->m_pCurrentRecordBatch->hasSchemaChanged()){
-                ret=QRY_SUCCESS_WITH_INFO;
-            }
-        }
-    }else{
-        ret=QRY_CANCEL;
+    if(this->m_pQueryResult->isCancelled()){
+    	return QRY_CANCEL;
     }
+
+    if(this->m_pCurrentRecordBatch==NULL || this->m_currentRecord==this->m_pCurrentRecordBatch->getNumRecords()){
+    	boost::lock_guard<boost::mutex> bufferLock(this->m_recordBatchMutex);
+    	if(this->m_pCurrentRecordBatch !=NULL){
+    		DRILL_MT_LOG(DRILL_LOG(LOG_TRACE) << "Deleted old Record batch " << (void*) m_pCurrentRecordBatch << std::endl;)
+                		delete this->m_pCurrentRecordBatch; //free the previous record batch
+    		this->m_pCurrentRecordBatch=NULL;
+    	}
+    	this->m_currentRecord=0;
+    	this->m_pQueryResult->waitForData();
+    	if(m_pQueryResult->hasError()){
+    		return m_pQueryResult->getErrorStatus();
+    	}
+    	this->m_pCurrentRecordBatch=this->m_pQueryResult->getNext();
+    	if(this->m_pCurrentRecordBatch != NULL){
+    		DRILL_MT_LOG(DRILL_LOG(LOG_TRACE) << "Fetched new Record batch " << std::endl;)
+    	}else{
+    		DRILL_MT_LOG(DRILL_LOG(LOG_TRACE) << "No new Record batch found " << std::endl;)
+    	}
+    	if(this->m_pCurrentRecordBatch==NULL || this->m_pCurrentRecordBatch->getNumRecords()==0){
+    		DRILL_MT_LOG(DRILL_LOG(LOG_TRACE) << "No more data." << std::endl;)
+                		ret = QRY_NO_MORE_DATA;
+    	}else if(this->m_pCurrentRecordBatch->hasSchemaChanged()){
+    		ret=QRY_SUCCESS_WITH_INFO;
+    	}
+    }
+
     return ret;
 }
 
@@ -259,30 +261,28 @@ status_t RecordIterator::getCol(size_t i, void** b, size_t* sz){
     //TODO: check fields out of bounds without calling getColDefs
     //if(i>=getColDefs().size()) return QRY_OUT_OF_BOUNDS;
     //return raw byte buffer
-    if(!this->m_pQueryResult->isCancelled()){
-        const ValueVectorBase* pVector=this->m_pCurrentRecordBatch->getFields()[i]->getVector();
-        if(!pVector->isNull(this->m_currentRecord)){
-            *b=pVector->getRaw(this->m_currentRecord);
-            *sz=pVector->getSize(this->m_currentRecord);
-        }else{
-            *b=NULL;
-            *sz=0;
-
-        }
-        return QRY_SUCCESS;
-    }else{
-        return QRY_CANCEL;
+    if(this->m_pQueryResult->isCancelled()){
+    	return QRY_CANCEL;
     }
+    const ValueVectorBase* pVector=this->m_pCurrentRecordBatch->getFields()[i]->getVector();
+    if(!pVector->isNull(this->m_currentRecord)){
+    	*b=pVector->getRaw(this->m_currentRecord);
+    	*sz=pVector->getSize(this->m_currentRecord);
+    }else{
+    	*b=NULL;
+    	*sz=0;
+    }
+    return QRY_SUCCESS;
 }
 
 /* true if ith column in the current record is NULL. */
 bool RecordIterator::isNull(size_t i){
-    if(!this->m_pQueryResult->isCancelled()){
-        const ValueVectorBase* pVector=this->m_pCurrentRecordBatch->getFields()[i]->getVector();
-        return pVector->isNull(this->m_currentRecord);
-    }else{
-        return false;
+    if(this->m_pQueryResult->isCancelled()){
+    	return false;
     }
+
+    const ValueVectorBase* pVector=this->m_pCurrentRecordBatch->getFields()[i]->getVector();
+    return pVector->isNull(this->m_currentRecord);
 }
 
 status_t RecordIterator::cancel(){
@@ -330,19 +330,15 @@ DrillClient::~DrillClient(){
 }
 
 connectionStatus_t DrillClient::connect(const char* connectStr, const char* defaultSchema){
-    connectionStatus_t ret=CONN_SUCCESS;
-    ret=this->m_pImpl->connect(connectStr);
     DrillUserProperties props;
     std::string schema(defaultSchema);
     props.setProperty(USERPROP_SCHEMA,  schema);
-    if(ret==CONN_SUCCESS){
-        if(defaultSchema!=NULL){
-            ret=this->m_pImpl->validateHandshake(&props);
-        }else{
-            ret=this->m_pImpl->validateHandshake(NULL);
-        }
+    if (defaultSchema != NULL) {
+    	return connect(connectStr, static_cast<DrillUserProperties*>(NULL));
     }
-    return ret;
+    else {
+    	return connect(connectStr, &props);
+    }
 }
 
 connectionStatus_t DrillClient::connect(const char* connectStr, DrillUserProperties* properties){
@@ -389,13 +385,24 @@ RecordIterator* DrillClient::submitQuery(Drill::QueryType t, const std::string& 
 }
 
 status_t DrillClient::prepareQuery(const std::string& sql, pfnPreparedStatementListener listener, void* listenerCtx, QueryHandle_t* qHandle) {
-    return QRY_FAILURE;
+	DrillClientPrepareHandle* pResult=this->m_pImpl->PrepareQuery(sql, listener, listenerCtx);
+	if(pResult==NULL){
+		*qHandle=NULL;
+		return static_cast<status_t>(this->m_pImpl->getError()->status);
+	}
+	*qHandle=reinterpret_cast<QueryHandle_t>(pResult);
+	return QRY_SUCCESS;
 }
 
 status_t DrillClient::executeQuery(const PreparedStatement& pstmt, pfnQueryResultsListener listener, void* listenerCtx, QueryHandle_t* qHandle) {
-    return QRY_FAILURE;
+	DrillClientQueryResult* pResult=this->m_pImpl->ExecuteQuery(pstmt, listener, listenerCtx);
+	if(pResult==NULL){
+		*qHandle=NULL;
+		return static_cast<status_t>(this->m_pImpl->getError()->status);
+	}
+	*qHandle=reinterpret_cast<QueryHandle_t>(pResult);
+	return QRY_SUCCESS;
 }
-
 
 void* DrillClient::getApplicationContext(QueryHandle_t handle){
     assert(handle!=NULL);
@@ -435,10 +442,11 @@ void DrillClient::freeRecordBatch(RecordBatch* pRecordBatch){
 }
 
 Metadata* DrillClient::getMetadata() {
-    return this->m_pImpl->getMetadata();
+    return static_cast<Metadata*>(this->m_pImpl->getMetadata());
 }
 
 void DrillClient::freeMetadata(Metadata** metadata) {
-    this->m_pImpl->freeMetadata(metadata);
+    this->m_pImpl->freeMetadata(static_cast<meta::DrillMetadata*>(*metadata));
+    *metadata = NULL;
 }
 } // namespace Drill
