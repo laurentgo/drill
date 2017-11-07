@@ -16,6 +16,7 @@
  */
 package org.apache.drill.jdbc;
 
+import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 
@@ -28,20 +29,21 @@ public interface DrillStatement extends Statement {
 
   /**
    * <strong>Drill</strong>:
-   * Returns zero, indicating that no timeout is set.
+   * Returns the number of seconds the driver will wait for a query to
+   * execute.
    *
    * @throws  AlreadyClosedSqlException
    *            if connection is closed
    */
   @Override
-  int getQueryTimeout() throws AlreadyClosedSqlException;
+  int getQueryTimeout() throws SQLException;
 
   /**
    * <strong>Drill</strong>:
-   * Not supported (for non-zero timeout value).
+   * supported (for positive timeout value).
    * <p>
-   *   Normally, just throws {@link SQLFeatureNotSupportedException} unless
-   *   request is trivially for no timeout (zero {@code milliseconds} value).
+   *   if zero, it means there's no limit. Otherwise it represents the number of
+   *   seconds the driver will wait for a query to execute.
    * </p>
    * @throws  AlreadyClosedSqlException
    *            if connection is closed
@@ -49,12 +51,10 @@ public interface DrillStatement extends Statement {
    *            if an invalid parameter value is detected (and not above case)
    * @throws  SQLFeatureNotSupportedException
    *            if timeout is non-zero (and not above case)
+   * @throws SQLException for any other reason
    */
   @Override
-  void setQueryTimeout( int milliseconds )
-      throws AlreadyClosedSqlException,
-             JdbcApiSqlException,
-             SQLFeatureNotSupportedException;
+  void setQueryTimeout( int seconds ) throws SQLException;
 
   /**
    * {@inheritDoc}

@@ -156,29 +156,22 @@ class DrillStatementImpl extends AvaticaStatement implements DrillStatement,
   }
 
   @Override
-  public int getQueryTimeout() throws AlreadyClosedSqlException
+  public int getQueryTimeout() throws SQLException
   {
     throwIfClosed();
-    return 0;  // (No no timeout.)
+    return super.getQueryTimeout();  // (No no timeout.)
   }
 
   @Override
-  public void setQueryTimeout( int milliseconds )
-      throws AlreadyClosedSqlException,
-             InvalidParameterSqlException,
-             SQLFeatureNotSupportedException {
+  public void setQueryTimeout( int seconds )
+      throws SQLException {
     throwIfClosed();
-    if ( milliseconds < 0 ) {
+    if ( seconds < 0 ) {
       throw new InvalidParameterSqlException(
-          "Invalid (negative) \"milliseconds\" parameter to setQueryTimeout(...)"
-          + " (" + milliseconds + ")" );
+          "Invalid (negative) \"seconds\" parameter to setQueryTimeout(...)"
+          + " (" + seconds + ")" );
     }
-    else {
-      if ( 0 != milliseconds ) {
-        throw new SQLFeatureNotSupportedException(
-            "Setting network timeout is not supported." );
-      }
-    }
+    super.setQueryTimeout(seconds);
   }
 
   @Override

@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.calcite.avatica.AvaticaResultSet;
@@ -52,6 +53,7 @@ import org.apache.drill.exec.rpc.user.QueryDataBatch;
 import org.apache.drill.exec.rpc.user.UserResultsListener;
 import org.apache.drill.exec.store.ischema.InfoSchemaConstants;
 import org.apache.drill.jdbc.SchemaChangeListener;
+import org.apache.drill.jdbc.SqlTimeoutException;
 import org.slf4j.Logger;
 
 import com.google.common.collect.Queues;
@@ -100,6 +102,8 @@ class DrillCursor implements Cursor {
     final LinkedBlockingDeque<QueryDataBatch> batchQueue =
         Queues.newLinkedBlockingDeque();
 
+    // time (as epoch in millis) the query should complete before
+    private long shouldCompleteBefore = Long.MAX_VALUE;
 
     /**
      * ...
@@ -139,8 +143,15 @@ class DrillCursor implements Cursor {
       return stopped;
     }
 
-    public void awaitFirstMessage() throws InterruptedException {
-      firstMessageReceived.await();
+    public void awaitFirstMessage() throws TimeoutException, InterruptedException {
+      if (shouldCompleteBefore == Long.MAX_VALUE) {
+        firstMessageReceived.await();
+      } else {
+        long remaining = shouldCompleteBefore - System.currentTimeMillis();
+        if (!firstMessageReceived.await(remaining, TimeUnit.MILLISECONDS)) {
+          throw new TimeoutException("Did not receive first message before timeout expiration.");
+        };
+      }
     }
 
     private void releaseIfFirst() {
@@ -212,7 +223,7 @@ class DrillCursor implements Cursor {
      * @throws InterruptedException
      *         if waiting on the queue was interrupted
      */
-    QueryDataBatch getNext() throws UserException, InterruptedException {
+    QueryDataBatch getNext() throws UserException, TimeoutException, InterruptedException {
       while (true) {
         if (executionFailureException != null) {
           logger.debug( "[#{}] Dequeued query failure exception: {}.",
@@ -222,7 +233,11 @@ class DrillCursor implements Cursor {
         if (completed && batchQueue.isEmpty()) {
           return null;
         } else {
-          QueryDataBatch qdb = batchQueue.poll(50, TimeUnit.MILLISECONDS);
+          long remaining = shouldCompleteBefore - System.currentTimeMillis();
+          if (remaining < 0) {
+            throw new TimeoutException("Query did not complete before timeout expiration");
+          }
+          QueryDataBatch qdb = batchQueue.poll(Math.min(remaining, 50), TimeUnit.MILLISECONDS);
           if (qdb != null) {
             lastDequeuedBatchNumber++;
             logger.debug( "[#{}] Dequeued query data batch #{}: {}.",
@@ -261,6 +276,10 @@ class DrillCursor implements Cursor {
       // we want to unblock the main thread.
       firstMessageReceived.countDown(); // TODO:  Why not call releaseIfFirst as used elsewhere?
       completed = true;
+    }
+
+    void setShouldCompleteBefore(long shouldCompleteBefore) {
+      this.shouldCompleteBefore = shouldCompleteBefore;
     }
 
   }
@@ -488,6 +507,11 @@ class DrillCursor implements Cursor {
         // error type is accessible, of course. :-( )
         throw new SQLException( e.getMessage(), e );
       }
+      catch ( TimeoutException e ) {
+        throw new SqlTimeoutException(
+            String.format("Cancelled after expiration of timeout of %d seconds.", statement.getQueryTimeout()),
+            e);
+      }
       catch ( InterruptedException e ) {
         // Not normally expected--Drill doesn't interrupt in this area (right?)--
         // but JDBC client certainly could.
@@ -536,6 +560,12 @@ class DrillCursor implements Cursor {
       preparedStatement = null;
     }
 
+    long queryTimeoutSecs = statement.getQueryTimeout();
+    if (queryTimeoutSecs > 0) {
+      long queryEnd = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(queryTimeoutSecs);
+      resultsListener.setShouldCompleteBefore(queryEnd);
+    }
+
     if (preparedStatement != null) {
       connection.getClient().executePreparedStatement(preparedStatement.getServerHandle(), resultsListener);
     }
@@ -545,6 +575,10 @@ class DrillCursor implements Cursor {
 
     try {
       resultsListener.awaitFirstMessage();
+    } catch ( TimeoutException e ) {
+      throw new SqlTimeoutException(
+          String.format("Cancelled after expiration of timeout of %d seconds.", statement.getQueryTimeout()),
+          e);
     } catch ( InterruptedException e ) {
       // Preserve evidence that the interruption occurred so that code higher up
       // on the call stack can learn of the interruption and respond to it if it
